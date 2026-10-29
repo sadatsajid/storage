@@ -501,6 +501,38 @@ describe('S3Disk multipart uploads', () => {
     );
   });
 
+  it('aborts when a part has no ETag and the next body chunk arrives later', async () => {
+    const { disk: s3, calls } = disk(
+      (call) => {
+        if (call.url.searchParams.has('uploads')) {
+          return xml('<InitiateMultipartUploadResult><UploadId>up-delayed</UploadId></InitiateMultipartUploadResult>');
+        }
+        if (call.url.searchParams.has('partNumber')) {
+          return call.url.searchParams.get('partNumber') === '1' ? ok() : ok({ etag: '"part"' });
+        }
+        return call.method === 'DELETE'
+          ? new Response(null, { status: 204 })
+          : xml('<CompleteMultipartUploadResult><ETag>"complete"</ETag></CompleteMultipartUploadResult>');
+      },
+      { multipart: { partSize } },
+    );
+    const chunks = async function* () {
+      yield Buffer.alloc(partSize);
+      yield Buffer.alloc(partSize);
+      // Let the part responses settle while the source is producing its next chunk
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      yield Buffer.alloc(MiB);
+    };
+
+    await expect(s3.put('big.bin', chunks())).rejects.toMatchObject({
+      operation: 'UploadPart',
+      code: 'InvalidResponse',
+      message: 'UploadPart failed: InvalidResponse: no ETag',
+    });
+    expect(calls.filter((call) => call.method === 'DELETE')).toHaveLength(1);
+    expect(calls.some((call) => call.method === 'POST' && call.url.searchParams.has('uploadId'))).toBe(false);
+  });
+
   it('an abort that fails too still reports the original failure', async () => {
     const { disk: s3, calls } = disk(
       (call) => {
